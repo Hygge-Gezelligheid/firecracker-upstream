@@ -1455,41 +1455,71 @@ pub(crate) mod tests {
         assert_eq!(unique.len(), indices.len(), "duplicate MSR indices found");
     }
 
+    fn cpuid_without_mtrr(vm: &KvmVm) -> Cpuid {
+        const MTRR_BITINDEX: u32 = 12;
+        let mut cpuid = Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap();
+        cpuid
+            .inner_mut()
+            .get_mut(&CpuidKey {
+                leaf: 0x1,
+                subleaf: 0x0,
+            })
+            .unwrap()
+            .result
+            .edx &= !(1 << MTRR_BITINDEX);
+        cpuid
+    }
+
     #[test]
     fn test_configure_msrs_for_boot_deduplicates_msrs_to_save() {
-        use crate::arch::x86_64::generated::msr_index::{MSR_IA32_MC0_CTL, MSR_TSC_AUX};
-        use crate::arch::x86_64::msr::{ArchCapaMSRFlags, MSR_IA32_ARCH_CAPABILITIES};
+        use crate::arch::x86_64::generated::msr_index::{
+            MSR_IA32_MC0_CTL, MSR_MTRRfix64K_00000, MSR_TSC_AUX,
+        };
 
         let (vm, mut vcpu) = setup_vcpu(0x10000);
         let baseline = vm.msrs_to_save().to_vec();
-        let cpuid = Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap();
+        let cpuid = cpuid_without_mtrr(&vm);
         let configured_cpuid = vcpu.configure_cpuid(&cpuid, 1, false).unwrap();
+
+        // With MTRR hidden in guest CPUID, MSR_MTRRfix64K_00000 is absent from both
+        // the host baseline and msrs_to_save_by_cpuid, yet KVM emulates it across
+        // Intel and AMD regardless of CPUID.
+        assert!(!baseline.contains(&MSR_MTRRfix64K_00000));
+        assert!(
+            !cpuid::common::msrs_to_save_by_cpuid(&configured_cpuid)
+                .contains(&MSR_MTRRfix64K_00000)
+        );
 
         let template_msrs = BTreeMap::from([
             (MSR_TSC_AUX, 0),
-            (MSR_IA32_ARCH_CAPABILITIES, ArchCapaMSRFlags::RDCL_NO.bits()),
+            (MSR_MTRRfix64K_00000, 0x0606_0606_0606_0606),
         ]);
         vcpu.configure_msrs_for_boot(&template_msrs, &configured_cpuid)
             .unwrap();
 
         assert_eq!(&vcpu.msrs_to_save[..baseline.len()], baseline.as_slice());
         assert_unique_msrs(&vcpu.msrs_to_save);
-        assert!(vcpu.msrs_to_save.contains(&MSR_IA32_ARCH_CAPABILITIES));
+        assert!(vcpu.msrs_to_save.contains(&MSR_MTRRfix64K_00000));
         assert!(vcpu.msrs_to_save.contains(&MSR_IA32_MC0_CTL));
     }
 
     #[test]
     fn test_restore_state_preserves_msrs_across_chained_snapshots() {
-        use crate::arch::x86_64::generated::msr_index::MSR_IA32_MC0_CTL;
-        use crate::arch::x86_64::msr::{ArchCapaMSRFlags, MSR_IA32_ARCH_CAPABILITIES};
+        use crate::arch::x86_64::generated::msr_index::{MSR_IA32_MC0_CTL, MSR_MTRRfix64K_00000};
 
         let (vm1, mut vcpu1) = setup_vcpu(0x10000);
-        let cpuid = Cpuid::try_from(vm1.kvm().supported_cpuid.clone()).unwrap();
+        let cpuid = cpuid_without_mtrr(&vm1);
         let configured_cpuid = vcpu1.configure_cpuid(&cpuid, 1, false).unwrap();
 
-        let expected_arch_cap = ArchCapaMSRFlags::RDCL_NO.bits();
+        assert!(!vm1.msrs_to_save().contains(&MSR_MTRRfix64K_00000));
+        assert!(
+            !cpuid::common::msrs_to_save_by_cpuid(&configured_cpuid)
+                .contains(&MSR_MTRRfix64K_00000)
+        );
+
+        let expected_mtrr_fix = 0x0606_0606_0606_0606;
         let expected_mc0_ctl = u64::MAX;
-        let template_msrs = BTreeMap::from([(MSR_IA32_ARCH_CAPABILITIES, expected_arch_cap)]);
+        let template_msrs = BTreeMap::from([(MSR_MTRRfix64K_00000, expected_mtrr_fix)]);
         vcpu1
             .configure_msrs_for_boot(&template_msrs, &configured_cpuid)
             .unwrap();
@@ -1505,7 +1535,7 @@ pub(crate) mod tests {
         vcpu2.restore_state(&state1).unwrap();
         assert_eq!(&vcpu2.msrs_to_save[..baseline.len()], baseline.as_slice());
         assert_unique_msrs(&vcpu2.msrs_to_save);
-        assert!(vcpu2.msrs_to_save.contains(&MSR_IA32_ARCH_CAPABILITIES));
+        assert!(vcpu2.msrs_to_save.contains(&MSR_MTRRfix64K_00000));
         assert!(vcpu2.msrs_to_save.contains(&MSR_IA32_MC0_CTL));
 
         let state2 = vcpu2.save_state().unwrap();
@@ -1515,16 +1545,16 @@ pub(crate) mod tests {
             .flat_map(|chunk| chunk.as_slice().iter().map(|entry| entry.index))
             .collect();
         assert_unique_msrs(&saved_indices);
-        assert!(saved_indices.contains(&MSR_IA32_ARCH_CAPABILITIES));
+        assert!(saved_indices.contains(&MSR_MTRRfix64K_00000));
         assert!(saved_indices.contains(&MSR_IA32_MC0_CTL));
 
         // Restore the second-generation snapshot into a third vCPU and check live values.
         let (_vm3, mut vcpu3) = setup_vcpu(0x10000);
         vcpu3.restore_state(&state2).unwrap();
         let restored = vcpu3
-            .get_msrs([MSR_IA32_ARCH_CAPABILITIES, MSR_IA32_MC0_CTL].into_iter())
+            .get_msrs([MSR_MTRRfix64K_00000, MSR_IA32_MC0_CTL].into_iter())
             .unwrap();
-        assert_eq!(restored[&MSR_IA32_ARCH_CAPABILITIES], expected_arch_cap);
+        assert_eq!(restored[&MSR_MTRRfix64K_00000], expected_mtrr_fix);
         assert_eq!(restored[&MSR_IA32_MC0_CTL], expected_mc0_ctl);
     }
 
